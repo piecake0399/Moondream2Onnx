@@ -1,0 +1,10 @@
+﻿onnxruntime
+transformers
+pillow
+psutil
+numpy==1.26.4
+torch
+datasets
+tqdm
+requests
+matplotlib
