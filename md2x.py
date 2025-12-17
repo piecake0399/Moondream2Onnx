@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 # md2.py -- Moondream2 ONNX pipeline (merged decoder q4)
-# Requires: onnxruntime, tokenizers, pillow, numpy
+# Requires: onnxruntime, tokenizers, pillow, numpy, tqdm, datasets
 
 import argparse
 import time
+import re
+import json
 import numpy as np
 import onnxruntime as ort
 from PIL import Image
 from tokenizers import Tokenizer
-import json
-
 from tqdm import tqdm
 from datasets import load_dataset
 
+import psutil
 
 # -------------------------
 # Helpers
@@ -43,6 +44,54 @@ def preprocess_image_pil(img: Image.Image):
     return arr.astype(np.float32)
 
 # -------------------------
+# Parse bbox text robustly
+# -------------------------
+_bbox_re = re.compile(
+    r"\[\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s*,\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s*,\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s*,\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s*\]"
+)
+
+def parse_bboxes_from_text(text):
+    """
+    Trả về list các bbox ở dạng normalized floats: [{"x_min":..., "y_min":..., "x_max":..., "y_max":...}, ...]
+    Lấy mọi occurences của pattern [x,y,x,y]
+    """
+    if not isinstance(text, str):
+        return []
+    matches = _bbox_re.findall(text)
+    bboxes = []
+    for m in matches:
+        try:
+            nums = [float(x) for x in m]
+            # sanity clamp 0..1
+            nums = [max(0.0, min(1.0, v)) for v in nums]
+            bboxes.append({
+                "x_min": nums[0],
+                "y_min": nums[1],
+                "x_max": nums[2],
+                "y_max": nums[3],
+            })
+        except Exception:
+            continue
+    return bboxes
+
+# -------------------------
+# IoU computation
+# -------------------------
+def compute_iou(boxA, boxB):
+    """boxA, boxB dạng [x1,y1,x2,y2] tuyệt đối"""
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+    interW = max(0, xB - xA)
+    interH = max(0, yB - yA)
+    interArea = interW * interH
+    boxAArea = max(0, (boxA[2] - boxA[0])) * max(0, (boxA[3] - boxA[1]))
+    boxBArea = max(0, (boxB[2] - boxB[0])) * max(0, (boxB[3] - boxB[1]))
+    union = boxAArea + boxBArea - interArea
+    return interArea / union if union > 0 else 0.0
+
+# -------------------------
 # Main class
 # -------------------------
 class Moondream2:
@@ -54,20 +103,17 @@ class Moondream2:
             self.tokenizer = Tokenizer.from_file("tokenizer.json")
         except Exception as e:
             raise RuntimeError("Failed to load tokenizer.json with tokenizers library. "
-                               "If tokenizer.json contains negative ids (Xenova ONNX), "
-                               "you must provide a compatible tokenizer (vocab.json + merges or HF AutoTokenizer). "
                                f"Original error: {e}")
 
-        # Load ONNX sessions
+        # Load ONNX sessions (FP16 vision/embed + merged decoder Q4)
         self.vision = ort.InferenceSession(f"{model_dir}/vision_encoder_fp16.onnx",
                                            providers=[provider])
         self.embed  = ort.InferenceSession(f"{model_dir}/embed_tokens_fp16.onnx",
                                            providers=[provider])
-        for i in self.embed.get_inputs(): print(i.name, i.type, i.shape)
         self.decoder= ort.InferenceSession(f"{model_dir}/decoder_model_merged_q4.onnx",
                                            providers=[provider])
 
-        # Print decoder signature for debug
+        # Print signatures if verbose
         if self.verbose:
             print("\n--- DECODER INPUT SIGNATURE ---")
             for i in self.decoder.get_inputs():
@@ -77,12 +123,11 @@ class Moondream2:
                 print(i.name, i.type, i.shape)
             print("")
 
-        # Model hyperparams (match your onnx export)
+        # Model hyperparams (tune if differs)
         self.num_layers = 24
         self.num_heads = 32
         self.head_dim = 64
-        # hidden dim from embed output (should be 2048)
-        self.hidden_dim = 2048
+        self.hidden_dim = 2048  # embed output
 
     # -------------------------
     # Vision encoder
@@ -124,28 +169,21 @@ class Moondream2:
         return past
 
     # -------------------------
-    # greedy decode for merged decoder (first call: full inputs_embeds; subsequent calls: 1 token + past)
+    # greedy decode (unchanged, returns list of token ids generated)
     # -------------------------
     def greedy_decode(self, prompt_ids, image_embeds, max_new_tokens=60):
-        """
-        prompt_ids: 1D list/np.array of prompt token ids (no batch)
-        image_embeds: (1, image_seq_len, hidden_dim) from vision encoder
-        """
         prompt_ids = np.asarray(prompt_ids, dtype=np.int64).reshape(-1)
         prompt_embeds = self.embed_tokens(prompt_ids)  # (1, P, H)
 
-        # First call: concatenate image + prompt into full inputs_embeds
+        # First call: concat image + prompt
         full_embeds = np.concatenate([image_embeds, prompt_embeds], axis=1)  # (1, S, H)
         seq_len = int(full_embeds.shape[1])
 
-        # Prepare initial inputs for first forward
         attention_mask = np.ones((1, seq_len), dtype=np.int64)
         position_ids = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
 
-        # empty past
         past = self.init_past()
 
-        # Build inputs dict for first call
         inputs = {
             "inputs_embeds": full_embeds.astype(np.float32),
             "attention_mask": attention_mask,
@@ -153,19 +191,11 @@ class Moondream2:
         }
         inputs.update(past)
 
-        if self.verbose:
-            print("[decode] First forward shapes:",
-                "inputs_embeds", short(full_embeds),
-                "attention_mask", attention_mask.shape,
-                "position_ids", position_ids.shape)
-
-        # First forward: get logits & present
         outputs = self.decoder.run(None, inputs)
-        logits = outputs[0]  # (1, seq_len, vocab) or (1, seq_len, vocab)
-        # outputs[1:] are interleaved present.N.key, present.N.value
+        logits = outputs[0]
         present = outputs[1:]
 
-        # parse present into past dict (map to past_key_values.i.key/value)
+        # parse present -> past
         new_past = {}
         idx = 0
         for i in range(self.num_layers):
@@ -174,7 +204,7 @@ class Moondream2:
             idx += 2
         past = new_past
 
-        # choose next token from last logit (logit for last position of full_embeds)
+        # pick token
         if logits.ndim == 3:
             next_id = int(np.argmax(logits[:, -1, :], axis=-1)[0])
         elif logits.ndim == 2:
@@ -183,24 +213,15 @@ class Moondream2:
             raise RuntimeError("unexpected logits shape: " + str(logits.shape))
 
         generated = [next_id]
-
-        # ===== FIXED: After first forward, cached length = seq_len (NOT 1) =====
-        past_len = seq_len           # <-- sửa chỗ này
-        # Next token absolute position = seq_len (0-based)
+        past_len = seq_len
         next_pos = seq_len
 
-        if self.verbose:
-            print(f"[decode] step0 next_id={next_id}, seq_len={seq_len}, past_len={past_len}")
-
-        # Subsequent steps: feed one token embedding and use past
+        # subsequent
         for step in range(max_new_tokens - 1):
-            # embed last token
             token_id_arr = np.array([next_id], dtype=np.int64)
             token_emb = self.embed_tokens(token_id_arr)  # (1,1,H)
 
-            # attention mask length = past_len + 1  (past_len reflects full cached length)
             attention_mask = np.ones((1, past_len + 1), dtype=np.int64)
-            # position_ids for token we are feeding (shape 1x1)
             position_ids = np.array([[next_pos]], dtype=np.int64)
 
             ort_inputs = {
@@ -208,16 +229,12 @@ class Moondream2:
                 "attention_mask": attention_mask,
                 "position_ids": position_ids
             }
-            # attach past_kv
             ort_inputs.update(past)
-
-            if self.verbose:
-                print(f"[decode] step={step+1} feed token {next_id} pos={next_pos} attn={attention_mask.shape}")
 
             outs = self.decoder.run(None, ort_inputs)
             logits = outs[0]
-            # parse present
             present = outs[1:]
+
             # map present -> past
             new_past = {}
             idx = 0
@@ -227,7 +244,6 @@ class Moondream2:
                 idx += 2
             past = new_past
 
-            # next id from logits last token
             if logits.ndim == 3:
                 next_id = int(np.argmax(logits[:, -1, :], axis=-1)[0])
             elif logits.ndim == 2:
@@ -236,31 +252,26 @@ class Moondream2:
                 raise RuntimeError("unexpected logits shape: " + str(logits.shape))
 
             generated.append(next_id)
-
-            # update counters
-            past_len += 1   # cached length increases by 1
+            past_len += 1
             next_pos += 1
 
-            # eos check
+            # quick EOS check
             try:
                 eos = self.tokenizer.token_to_id("</s>")
             except Exception:
                 eos = None
             if eos is not None and next_id == eos:
-                if self.verbose:
-                    print("[decode] EOS generated, stop.")
                 break
 
         return generated
 
-
     # -------------------------
-    # run tasks (Florence2-style buckets)
+    # run tasks (with special handling for visual grounding)
     # -------------------------
     def run_tasks(self, image_input, tasks, max_new_tokens=60):
         """
         tasks: list of dicts like {"name":"caption", "prompt":"Describe this image."}
-        returns dict name -> generated_text
+        returns dict name -> output (string or structured)
         """
         if isinstance(image_input, str):
             img = Image.open(image_input)
@@ -268,15 +279,49 @@ class Moondream2:
             img = image_input
 
         image_embeds = self.encode_image(img)
-
         results = {}
+
         for t in tasks:
+            name = t["name"]
             prompt = t["prompt"]
+
+            # Tokenize prompt
             prompt_ids = np.array(self.tokenizer.encode(prompt).ids, dtype=np.int64)
+
+            # Generate token ids
             gen_ids = self.greedy_decode(prompt_ids, image_embeds, max_new_tokens=max_new_tokens)
-            all_ids = prompt_ids.tolist() + gen_ids
-            txt = self.tokenizer.decode(all_ids)
-            results[t["name"]] = txt
+
+            # Decode generated tokens to text (only generated part)
+            gen_text = self.tokenizer.decode(gen_ids)
+
+            # Full text (prompt + generated) if needed
+            full_text = self.tokenizer.decode(prompt_ids.tolist() + gen_ids)
+
+            # If this is a visual grounding task, parse bbox(es) and return structured result
+            if "ground" in name or "visual" in name or "phrase" in name:
+                # parse bboxes from gen_text (prefer generated only), fallback to full_text
+                bboxes = parse_bboxes_from_text(gen_text)
+                if not bboxes:
+                    bboxes = parse_bboxes_from_text(full_text)
+
+                # take ONLY the first bbox as canonical answer (to avoid repeated duplicates)
+                objects = []
+                if bboxes:
+                    first = bboxes[0]
+                    objects.append(first)
+
+                # Build structured result
+                results[name] = {
+                    "text": full_text,
+                    "objects": objects  # normalized coords
+                }
+            else:
+                # generic text task
+                results[name] = full_text
+
+            if self.verbose:
+                print(f"[run_tasks] task={name} -> text(len)={len(full_text)} bboxes_found={len(results.get(name,{} ).get('objects',[])) if isinstance(results[name], dict) else 0}")
+
         return results
 
     # -------------------------
@@ -287,61 +332,23 @@ class Moondream2:
         res = self.run_tasks(image_input, tasks, max_new_tokens=max_new_tokens)
         return res["caption"]
 
-def safe_parse_objects(output_text):
-    """
-    Moondream2 sometimes outputs JSON, sometimes text.
-    Try to parse JSON; otherwise return [].
-    """
-    try:
-        data = json.loads(output_text)
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict) and "bboxes" in data:
-            return data["bboxes"]
-    except Exception:
-        return []
-    return []
-
 # -------------------------
-# IoU computation
+# Evaluation helper (RefCOCO)
 # -------------------------
-def compute_iou(boxA, boxB):
-    """boxA, boxB dạng [x1,y1,x2,y2] tuyệt đối"""
-    xA = max(boxA[0], boxB[0])
-    yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2])
-    yB = min(boxA[3], boxB[3])
-    interW = max(0, xB - xA)
-    interH = max(0, yB - yA)
-    interArea = interW * interH
-    boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
-    boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
-    union = boxAArea + boxBArea - interArea
-    return interArea / union if union > 0 else 0.0
-
-# -------------------------
-# Moondream2 RefCOCO benchmark
-# -------------------------
-
 def evaluate_dataset_moondream2(model, dataset, n_samples=None):
-    """
-    Benchmark Moondream2 visual grounding on RefCOCO (HF dataset version).
-
-    Args:
-        model: mô hình Moondream2 (đã load)
-        dataset: dataset HF (load_dataset("jxu124/refcoco-benchmark", split="refcoco_unc_val"))
-        img_root: đường dẫn vào thư mục ảnh
-        n_samples: số lượng mẫu tối đa để đánh giá (None = toàn bộ)
-    """
     total = 0
     correct = 0
     processed_samples = 0
+
+    infers = []
+    
+    process = psutil.Process()
+    rss_before = process.memory_info().rss
 
     for i, sample in enumerate(tqdm(dataset, desc="Evaluating RefCOCO with Moondream2")):
         if (n_samples is not None) and (processed_samples >= n_samples):
             break
 
-        # ảnh trong dataset là PIL.Image
         img = sample["image"].convert("RGB")
         ref_list = sample["ref_list"]
 
@@ -355,25 +362,35 @@ def evaluate_dataset_moondream2(model, dataset, n_samples=None):
             for sentence_info in sentences:
                 expr = sentence_info["sent"]
 
-                # === inference bằng Moondream2 ===
+                # compose strong JSON-only prompt (ask for exactly one bbox)
+                prompt = (
+                    "<Image>\n"
+                    "Locate the following object and output EXACTLY ONE bounding box in JSON array format:\n"
+                    f"\"{expr}\"\n"
+                    "Output format (required): [{'[x_min, y_min, x_max, y_max]'}]\n"
+                    "Only output the JSON array and nothing else.\n"
+                    "Answer:"
+                )
+
                 try:
+                    # -----------MEASURE------------
+                    start = time.time()
+                    # ------------------------------
                     result = model.run_tasks(
                         img,
-                        tasks = [
-                            {
-                                "name": "phrase_grounding",
-                                "prompt": f"<Image>\nGround the following phrase in the image:\n{expr}\nAnswer:"
-                            }
-                        ],
-                        max_new_tokens=128
+                        tasks=[{"name":"visual_grounding", "prompt": prompt}],
+                        max_new_tokens=48
                     )
-                    text_output = result["phrase_grounding"]
-                    objects = safe_parse_objects(text_output)
+                    objects = result["visual_grounding"]["objects"]
+                    # -----------MEASURE------------
+                    end = time.time()
+                    # ------------------------------
+                    infer_time = end - start
+                    infers.append(infer_time)
                 except Exception:
                     objects = []
 
                 if not objects:
-                    # Không phát hiện được object nào
                     total += 1
                     processed_samples += 1
                     continue
@@ -381,7 +398,6 @@ def evaluate_dataset_moondream2(model, dataset, n_samples=None):
                 img_w, img_h = img.size
                 best_iou = 0.0
                 for obj in objects:
-                    # Chuyển bbox normalized → pixel
                     x1 = obj["x_min"] * img_w
                     y1 = obj["y_min"] * img_h
                     x2 = obj["x_max"] * img_w
@@ -397,10 +413,22 @@ def evaluate_dataset_moondream2(model, dataset, n_samples=None):
                 processed_samples += 1
 
     acc = correct / total if total > 0 else 0.0
-    print(f"\n📊 Benchmark Results ({processed_samples} samples):")
-    print(f" - Accuracy@0.5: {acc*100:.2f}% ({correct}/{total})")
+    rss_after = process.memory_info().rss
+    total_mem_used_bytes = rss_after - rss_before
+    total_mem_used_mb = total_mem_used_bytes / 1024 / 1024
 
-    return {"accuracy": acc, "correct": correct, "total": total}
+    print("------- Evaluation Results ------")
+    print(f"Correct predictions: {correct}/{total}")
+    print(f"Accuracy: {acc*100:.2f}%")
+    print("---------------------------------")
+    print(f"Average inference time: {np.mean(infers):.4f} seconds")
+    print(f"Minimum inference time: {np.min(infers):.4f} seconds")
+    print(f"Maximum inference time: {np.max(infers):.4f} seconds")
+    print("---------------------------------")
+    print(f"Total memory used during benchmark: {total_mem_used_mb:.2f} MB")
+    # print(f"Maximum peak RAM usage: {np.max(peak_mems) / 1024 / 1024:.2f} MB")
+    print("---------------------------------")
+    #return {"accuracy": acc, "correct": correct, "total": total}
 
 # -------------------------
 # CLI
@@ -410,12 +438,12 @@ def main():
     parser.add_argument("image", help="path to image file")
     parser.add_argument("--model-dir", default="weight_files")
     parser.add_argument("--provider", default="CPUExecutionProvider")
-    parser.add_argument("--task", choices=["caption","vqa","all"], default="caption")
+    parser.add_argument("--task", choices=["caption","vqa","visual_grounding","all"], default="caption")
+    parser.add_argument("--expr", default=None, help="expression for grounding")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--max-tokens", type=int, default=60)
     args = parser.parse_args()
 
-    # prepare tasks
     if args.task == "caption":
         tasks = [{"name":"caption", "prompt":"<Image>\nDescribe this image.\nAnswer:"}]
     elif args.task == "vqa":
@@ -423,11 +451,22 @@ def main():
             {"name":"what_is_in_image", "prompt":"<Image>\nWhat is in the image?\nAnswer:"},
             {"name":"color_question", "prompt":"<Image>\nWhat is the dominant color?\nAnswer:"}
         ]
+    elif args.task == "visual_grounding":
+        expr = args.expr or "the object"
+        prompt = (
+            "<Image>\n"
+            "Locate the following object and output EXACTLY ONE bounding box in JSON array format:\n"
+            f"\"{expr}\"\n"
+            "Output format (required): [[x_min, y_min, x_max, y_max]]\n"
+            "Only output the JSON array and nothing else.\n"
+            "Answer:"
+        )
+        tasks = [{"name":"visual_grounding", "prompt": prompt}]
     else:
         tasks = [
             {"name":"caption", "prompt":"<Image>\nDescribe this image.\nAnswer:"},
             {"name":"what_is_in_image", "prompt":"<Image>\nWhat is in the image?\nAnswer:"},
-            {"name":"vqa_example", "prompt":"<Image>\nIs there a car in the image?\nAnswer:"},
+            {"name":"visual_grounding", "prompt":"<Image>\nLocate the following object and output EXACTLY ONE bounding box in JSON array format:\n\"the object\"\nOutput format (required): [[x_min, y_min, x_max, y_max]]\nOnly output the JSON array and nothing else.\nAnswer:"}
         ]
 
     model = Moondream2(model_dir=args.model_dir, provider=args.provider, verbose=args.verbose)
@@ -439,24 +478,53 @@ def main():
     print("\n=== Results ===")
     for k, v in results.items():
         print(f"-- {k} --")
-        print(v)
+        print(json.dumps(v, indent=2) if isinstance(v, dict) else v)
         print()
 
     print(f"Elapsed {end - start:.2f}s")
 
 if __name__ == "__main__":
+    # main()
     model = Moondream2(model_dir="weight_files", provider="CPUExecutionProvider", verbose=False)
     dataset = load_dataset("jxu124/refcoco-benchmark", split="refcoco_unc_val")
-    #evaluate_dataset_moondream2(model, dataset, n_samples=100)
-    expr = "the space shuttle"
-    result = model.run_tasks(
-        "spaceshuttle.jpg",
-        tasks = [
-            {
-                "name": "visual_grounding",
-                "prompt": f"<Image>\nLocate the following object in the image and export bounding box in json format:\n{expr} \nAnswer:"
-            }
-        ],
-        max_new_tokens=30
-    )
-    print(result)
+    evaluate_dataset_moondream2(model, dataset, n_samples=20)
+    
+    # img = Image.open("spaceshuttle.jpg")
+    # img_w, img_h = img.size
+    # gt = [
+    #     0.39 * img_w,
+    #     0.11 * img_h,
+    #     0.56 * img_w,
+    #     0.75 * img_h,
+    # ]
+
+    # expr = "the space shuttle"
+    # prompt = (
+    #     "<Image>\n"
+    #     "Locate the following object and output EXACTLY ONE bounding box in JSON array format:\n"
+    #     f"\"{expr}\"\n"
+    #     "Output format (required): [[x_min, y_min, x_max, y_max]]\n"
+    #     "Only output the JSON array and nothing else.\n"
+    #     "Answer:"
+    # )
+    # tasks = [{"name":"visual_grounding", "prompt": prompt}]
+    # result = model.run_tasks(
+    #     "spaceshuttle.jpg",
+    #     tasks=tasks,
+    #     max_new_tokens=30
+    # )
+    # objects = result["visual_grounding"]["objects"]
+    # obj = objects[0]
+
+    # # normalized → pixel
+    # pred = [
+    #     obj["x_min"] * img_w,
+    #     obj["y_min"] * img_h,
+    #     obj["x_max"] * img_w,
+    #     obj["y_max"] * img_h,
+    # ]
+
+    # iou = compute_iou(pred, gt)
+    # print("Pred bbox:", pred)
+    # print("IoU =", iou)
+
